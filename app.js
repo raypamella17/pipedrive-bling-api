@@ -4,13 +4,36 @@ const express = require("express");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const mongoose = require("mongoose");
 
 const app = express();
 
 const PORT = 3000;
 
 app.use(express.json());
+mongoose
+  .connect(process.env.MONGODB_URI)
+  .then(() => {
+    console.log("MongoDB conectado com sucesso!");
+  })
+  .catch((error) => {
+    console.error("Erro ao conectar no MongoDB:", error.message);
+  });
 
+const integrationSchema = new mongoose.Schema({
+  pipedriveDealId: Number,
+  title: String,
+  value: Number,
+  status: String,
+  blingOrderId: String,
+  blingResponse: Object,
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+const Integration = mongoose.model("Integration", integrationSchema);
 app.get("/", (req, res) => {
     res.json({
         message: "Pipedrive + Bling API funcionando!"
@@ -219,7 +242,7 @@ app.post("/api/integrations/pipedrive-to-bling", async (req, res) => {
     itens: [
         {
             id: 0,
-            codigo: `PD-${deal.id}`,
+           codigo: `PD-${deal.id}-${Date.now()}`,
                     unidade: "UN",
                     quantidade: 1,
                     valor: Number(deal.value) || 0,
@@ -228,10 +251,9 @@ app.post("/api/integrations/pipedrive-to-bling", async (req, res) => {
                 }
             ],
             parcelas: [],
-            observacoes: `Pedido criado automaticamente a partir da oportunidade ganha no Pipedrive. Deal ID: ${deal.id}`
-        };
-
-        const blingResponse = await axios.post(
+observacoes: `Pedido criado automaticamente a partir da oportunidade ganha no Pipedrive. Deal ID: ${deal.id}. Criado em: ${new Date().toISOString()}`
+};
+const blingResponse = await axios.post(
             "https://api.bling.com.br/Api/v3/pedidos/vendas",
             orderPayload,
             {
@@ -243,6 +265,15 @@ app.post("/api/integrations/pipedrive-to-bling", async (req, res) => {
             }
         );
 
+const savedIntegration = await Integration.create({
+  pipedriveDealId: deal.id,
+  title: deal.title,
+  value: Number(deal.value) || 0,
+  status: deal.status,
+  blingOrderId: blingResponse.data?.data?.id || null,
+  blingResponse: blingResponse.data
+});
+
         res.status(201).json({
             message: "Oportunidade do Pipedrive enviada como pedido para o Bling",
             pipedriveDeal: {
@@ -251,7 +282,8 @@ app.post("/api/integrations/pipedrive-to-bling", async (req, res) => {
                 value: deal.value,
                 status: deal.status
             },
-            blingOrder: blingResponse.data
+         blingOrder: blingResponse.data,
+savedIntegration
         });
     } catch (error) {
         res.status(500).json({
@@ -259,6 +291,43 @@ app.post("/api/integrations/pipedrive-to-bling", async (req, res) => {
             details: error.response?.data || error.message
         });
     }
+});
+app.get("/api/integrations/consolidated", async (req, res) => {
+  try {
+    const consolidated = await Integration.aggregate([
+      {
+        $group: {
+          _id: {
+            $dateToString: {
+              format: "%Y-%m-%d",
+              date: "$createdAt"
+            }
+          },
+          totalOpportunities: { $sum: 1 },
+          totalValue: { $sum: "$value" }
+        }
+      },
+      {
+        $sort: {
+          _id: -1
+        }
+      }
+    ]);
+
+    res.json({
+      message: "Dados consolidados por dia",
+      data: consolidated.map((item) => ({
+        date: item._id,
+        totalOpportunities: item.totalOpportunities,
+        totalValue: item.totalValue
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: "Erro ao buscar dados consolidados",
+      details: error.message
+    });
+  }
 });
 app.get("/api/bling/contacts", async (req, res) => {
     try {
