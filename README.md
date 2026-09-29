@@ -62,3 +62,35 @@ Para uso em produção, seria necessário melhorar:
 - Renovação automática do token do Bling.
 - Persistência dos dados em banco de dados.
 - Logs da integração.
+- ## Persistência com MongoDB
+Além de criar pedidos no Bling, a API também salva no MongoDB Atlas os dados da oportunidade enviada.
+
+Dados salvos:
+- ID da oportunidade no Pipedrive
+- Título da oportunidade
+- Valor
+- Status
+- Resposta do Bling
+- Data da integração
+
+## Endpoint de dados consolidados
+
+GET /api/integrations/consolidated
+
+Esse endpoint retorna os dados agrupados por dia, mostrando:
+- Data
+- Quantidade de oportunidades enviadas
+- Valor total das oportunidades
+
+Exemplo de resposta:
+
+{
+  "message": "Dados consolidados por dia",
+  "data": [
+    {
+      "date": "2026-09-29",
+      "totalOpportunities": 1,
+      "totalValue": 100
+    }
+  ]
+}
