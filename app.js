@@ -5,6 +5,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const mongoose = require("mongoose");
+const { findExistingBlingOrder } = require("./integrationRules");
 
 const app = express();
 
@@ -21,7 +22,13 @@ mongoose
   });
 
 const integrationSchema = new mongoose.Schema({
-  pipedriveDealId: Number,
+
+pipedriveDealId: {
+    type: Number,
+    required: true,
+    unique: true
+},
+
   title: String,
   value: Number,
   status: String,
@@ -228,6 +235,18 @@ app.post("/api/integrations/pipedrive-to-bling", async (req, res) => {
         }
 
         const deal = deals[0];
+    const existingIntegration = await Integration.findOne({
+    pipedriveDealId: deal.id
+    });
+
+    if (existingIntegration) {
+    return res.status(200).json({
+        message: "Esta oportunidade já foi integrada ao Bling.",
+        alreadyIntegrated: true,
+        pipedriveDealId: deal.id,
+        blingOrderId: existingIntegration.blingOrderId
+    });
+}
 
         const today = new Date().toISOString().split("T")[0];
 
@@ -253,6 +272,34 @@ app.post("/api/integrations/pipedrive-to-bling", async (req, res) => {
             parcelas: [],
 observacoes: `Pedido criado automaticamente a partir da oportunidade ganha no Pipedrive. Deal ID: ${deal.id}. Criado em: ${new Date().toISOString()}`
 };
+
+const parametros = new URLSearchParams();
+parametros.append("numerosLojas[]", orderPayload.numeroLoja);
+
+const consultaBling = await axios.get(
+    "https://api.bling.com.br/Api/v3/pedidos/vendas",
+    {
+        params: parametros,
+        headers: {
+            Authorization: `Bearer ${blingAccessToken}`
+        }
+    }
+);
+
+
+const pedidoExistente = findExistingBlingOrder(
+    consultaBling.data?.data,
+    orderPayload.numeroLoja
+);
+
+if (pedidoExistente) {
+    return res.status(200).json({
+        message: "Este pedido já existe no Bling.",
+        alreadyIntegrated: true,
+        blingOrderId: pedidoExistente.id
+    });
+}
+
 const blingResponse = await axios.post(
             "https://api.bling.com.br/Api/v3/pedidos/vendas",
             orderPayload,
