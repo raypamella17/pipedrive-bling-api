@@ -5,7 +5,7 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const mongoose = require("mongoose");
-const { findExistingBlingOrder } = require("./integrationRules");
+const { createIntegrationHandler } = require("./integrationHandler");
 
 const app = express();
 
@@ -32,6 +32,11 @@ pipedriveDealId: {
   title: String,
   value: Number,
   status: String,
+syncStatus: {
+    type: String,
+    enum: ["processing", "completed", "needs_review"]
+},
+
   blingOrderId: String,
   blingResponse: Object,
   createdAt: {
@@ -202,152 +207,26 @@ app.get("/api/bling/orders", async (req, res) => {
     }
 });
 
-app.post("/api/integrations/pipedrive-to-bling", async (req, res) => {
-    try {
-        const companyDomain = process.env.PIPEDRIVE_COMPANY_DOMAIN;
-        const pipedriveToken = process.env.PIPEDRIVE_API_TOKEN;
-        const blingAccessToken = process.env.BLING_ACCESS_TOKEN;
+// O processamento fica em um módulo separado para testes sem Bling/MongoDB reais.
+app.post("/api/integrations/pipedrive-to-bling", createIntegrationHandler({
+    Integration,
+    httpClient: axios,
+    env: process.env
+}));
 
-        if (!companyDomain || !pipedriveToken || !blingAccessToken) {
-            return res.status(400).json({
-                error: "Configure PIPEDRIVE_COMPANY_DOMAIN, PIPEDRIVE_API_TOKEN e BLING_ACCESS_TOKEN no .env"
-            });
-        }
-
-        const pipedriveUrl = `https://${companyDomain}.pipedrive.com/api/v2/deals`;
-
-        const pipedriveResponse = await axios.get(pipedriveUrl, {
-            headers: {
-                "x-api-token": pipedriveToken
-            },
-            params: {
-                status: "won",
-                limit: 1
-            }
-        });
-
-        const deals = pipedriveResponse.data.data;
-
-        if (!deals || deals.length === 0) {
-            return res.status(404).json({
-                error: "Nenhuma oportunidade ganha encontrada no Pipedrive"
-            });
-        }
-
-        const deal = deals[0];
-    const existingIntegration = await Integration.findOne({
-    pipedriveDealId: deal.id
-    });
-
-    if (existingIntegration) {
-    return res.status(200).json({
-        message: "Esta oportunidade já foi integrada ao Bling.",
-        alreadyIntegrated: true,
-        pipedriveDealId: deal.id,
-        blingOrderId: existingIntegration.blingOrderId
-    });
-}
-
-        const today = new Date().toISOString().split("T")[0];
-
-        const orderPayload = {
-    numeroLoja: `PD-${deal.id}`,
-    data: today,
-    dataSaida: today,
-    dataPrevista: today,
-    contato: {
-        id: 18420326561
-    },
-    itens: [
-        {
-            id: 0,
-           codigo: `PD-${deal.id}-${Date.now()}`,
-                    unidade: "UN",
-                    quantidade: 1,
-                    valor: Number(deal.value) || 0,
-                    valorLista: Number(deal.value) || 0,
-                    descricao: deal.title || "Oportunidade Pipedrive"
-                }
-            ],
-            parcelas: [],
-observacoes: `Pedido criado automaticamente a partir da oportunidade ganha no Pipedrive. Deal ID: ${deal.id}. Criado em: ${new Date().toISOString()}`
-};
-
-const parametros = new URLSearchParams();
-parametros.append("numerosLojas[]", orderPayload.numeroLoja);
-
-const consultaBling = await axios.get(
-    "https://api.bling.com.br/Api/v3/pedidos/vendas",
-    {
-        params: parametros,
-        headers: {
-            Authorization: `Bearer ${blingAccessToken}`
-        }
-    }
-);
-
-
-const pedidoExistente = findExistingBlingOrder(
-    consultaBling.data?.data,
-    orderPayload.numeroLoja
-);
-
-if (pedidoExistente) {
-    return res.status(200).json({
-        message: "Este pedido já existe no Bling.",
-        alreadyIntegrated: true,
-        blingOrderId: pedidoExistente.id
-    });
-}
-
-const blingResponse = await axios.post(
-            "https://api.bling.com.br/Api/v3/pedidos/vendas",
-            orderPayload,
-            {
-                headers: {
-                    Authorization: `Bearer ${blingAccessToken}`,
-                    Accept: "application/json",
-                    "Content-Type": "application/json"
-                }
-            }
-        );
-
-const savedIntegration = await Integration.create({
-  pipedriveDealId: deal.id,
-  title: deal.title,
-  value: Number(deal.value) || 0,
-  status: deal.status,
-  blingOrderId: blingResponse.data?.data?.id || null,
-  blingResponse: blingResponse.data
-});
-
-        res.status(201).json({
-            message: "Oportunidade do Pipedrive enviada como pedido para o Bling",
-            pipedriveDeal: {
-                id: deal.id,
-                title: deal.title,
-                value: deal.value,
-                status: deal.status
-            },
-         blingOrder: blingResponse.data,
-savedIntegration
-        });
-    } catch (error) {
-console.error("Falha na integração:", {
-    mensagem: error.message,
-    httpStatus: error.response?.status,
-    mongoCode: error.code
-});
-
-        res.status(500).json({
-            error: "Erro ao integrar Pipedrive com Bling",
-            details: error.response?.data || error.message
-        });
-    }
-});
 app.get("/api/integrations/consolidated", async (req, res) => {
   try {
     const consolidated = await Integration.aggregate([
+      // Não somar pedidos ainda em processamento ou aguardando revisão.
+      // Documentos antigos sem syncStatus são mantidos no consolidado.
+      {
+        $match: {
+          $or: [
+            { syncStatus: "completed" },
+            { syncStatus: { $exists: false } }
+          ]
+        }
+      },
       {
         $group: {
           _id: {
