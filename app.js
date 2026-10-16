@@ -333,6 +333,12 @@ const savedIntegration = await Integration.create({
 savedIntegration
         });
     } catch (error) {
+console.error("Falha na integração:", {
+    mensagem: error.message,
+    httpStatus: error.response?.status,
+    mongoCode: error.code
+});
+
         res.status(500).json({
             error: "Erro ao integrar Pipedrive com Bling",
             details: error.response?.data || error.message
