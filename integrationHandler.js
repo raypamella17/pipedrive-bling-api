@@ -10,8 +10,10 @@ function createIntegrationHandler({ Integration, httpClient, env, logger = conso
         throw new Error("Integration, httpClient e env são obrigatórios.");
     }
 
-    return async function integratePipedriveToBling(_req, res) {
+    return async function integratePipedriveToBling(req, res) {
         let processingIntegration = null;
+        // A prévia é opt-in e executa exclusivamente operações de leitura.
+        const dryRun = req?.query?.dryRun === "true";
 
         try {
             const companyDomain = env.PIPEDRIVE_COMPANY_DOMAIN;
@@ -24,11 +26,21 @@ function createIntegrationHandler({ Integration, httpClient, env, logger = conso
                 });
             }
 
+            // A opção dealId permite escolher uma oportunidade dentre as primeiras 100
+            // retornadas pelo Pipedrive, apenas durante a prévia.
+            const requestedDealId = dryRun && req?.query?.dealId !== undefined
+                ? Number(req.query.dealId)
+                : null;
+            if (requestedDealId !== null &&
+                (!Number.isSafeInteger(requestedDealId) || requestedDealId <= 0)) {
+                return res.status(400).json({ error: "dealId precisa ser um inteiro positivo." });
+            }
+
             const pipedriveResponse = await httpClient.get(
                 `https://${companyDomain}.pipedrive.com/api/v2/deals`,
                 {
                     headers: { "x-api-token": pipedriveToken },
-                    params: { status: "won", limit: 1 }
+                    params: { status: "won", limit: dryRun ? 100 : 1 }
                 }
             );
 
@@ -42,13 +54,31 @@ function createIntegrationHandler({ Integration, httpClient, env, logger = conso
                 });
             }
 
-            const deal = deals[0];
+            const deal = requestedDealId === null
+                ? deals[0]
+                : deals.find((item) => Number(item.id) === requestedDealId);
+            if (!deal) {
+                return res.status(404).json({
+                    error: "Oportunidade não encontrada na primeira página de negócios ganhos."
+                });
+            }
             if (!Number.isSafeInteger(Number(deal.id)) || Number(deal.id) <= 0) {
                 throw new Error("O Pipedrive não retornou um ID de oportunidade válido.");
             }
 
             const existingIntegration = await Integration.findOne({ pipedriveDealId: deal.id });
             if (existingIntegration) {
+                if (dryRun) {
+                    return res.status(200).json({
+                        dryRun: true,
+                        message: "Prévia: oportunidade já registrada no MongoDB.",
+                        pipedriveDealId: deal.id,
+                        syncStatus: existingIntegration.syncStatus ?? "legacy",
+                        blingOrderId: existingIntegration.blingOrderId ?? null,
+                        wouldAttemptCreate: false,
+                        writesPerformed: false
+                    });
+                }
                 if (["processing", "needs_review"].includes(existingIntegration.syncStatus)) {
                     return res.status(409).json({
                         message: existingIntegration.syncStatus === "processing"
@@ -87,6 +117,34 @@ function createIntegrationHandler({ Integration, httpClient, env, logger = conso
                 parcelas: [],
                 observacoes: `Pedido criado automaticamente a partir da oportunidade ganha no Pipedrive. Deal ID: ${deal.id}. Criado em: ${new Date().toISOString()}`
             };
+
+            if (dryRun) {
+                // Sem criar reserva nem pedido: apenas consulta os pedidos existentes.
+                const params = new URLSearchParams();
+                params.append("numerosLojas[]", orderPayload.numeroLoja);
+                const consulta = await httpClient.get(
+                    "https://api.bling.com.br/Api/v3/pedidos/vendas",
+                    {
+                        params,
+                        headers: { Authorization: `Bearer ${blingAccessToken}` }
+                    }
+                );
+                const pedidoExistente = findExistingBlingOrder(
+                    consulta.data?.data,
+                    orderPayload.numeroLoja
+                );
+                return res.status(200).json({
+                    dryRun: true,
+                    message: "Prévia concluída, sem criar pedidos ou registros.",
+                    pipedriveDealId: deal.id,
+                    numeroLoja: orderPayload.numeroLoja,
+                    existsInMongo: false,
+                    existsInBling: Boolean(pedidoExistente),
+                    blingOrderId: pedidoExistente?.id ?? null,
+                    wouldAttemptCreate: !pedidoExistente,
+                    writesPerformed: false
+                });
+            }
 
             // A criação com índice único é a reserva atômica: apenas uma requisição vence.
             processingIntegration = await Integration.create({
