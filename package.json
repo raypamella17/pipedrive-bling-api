@@ -1,12 +1,22 @@
 {
   "name": "pipedrive-bling-api",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "API RESTful para integrar oportunidades ganhas do Pipedrive a pedidos do Bling, com MongoDB, dry run e testes",
+  "main": "app.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node app.js",
+    "test": "node --test integrationRules.test.js integrationHandler.test.js integrationDryRun.test.js",
+    "test:security": "node --test security.test.js"
   },
-  "keywords": [],
+  "keywords": [
+    "nodejs",
+    "express",
+    "mongodb",
+    "pipedrive",
+    "bling",
+    "api",
+    "integration"
+  ],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
