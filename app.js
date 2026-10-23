@@ -5,6 +5,8 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const mongoose = require("mongoose");
+const { createIntegrationHandler } = require("./integrationHandler");
+const crypto = require("node:crypto");
 
 const app = express();
 
@@ -21,10 +23,21 @@ mongoose
   });
 
 const integrationSchema = new mongoose.Schema({
-  pipedriveDealId: Number,
+
+pipedriveDealId: {
+    type: Number,
+    required: true,
+    unique: true
+},
+
   title: String,
   value: Number,
   status: String,
+syncStatus: {
+    type: String,
+    enum: ["processing", "completed", "needs_review"]
+},
+
   blingOrderId: String,
   blingResponse: Object,
   createdAt: {
@@ -40,7 +53,7 @@ app.get("/", (req, res) => {
     });
 });
 
-app.get("/api/pipedrive/deals/won", async (req, res) => {
+app.get("/api/pipedrive/deals/won", requireIntegrationApiKey, async (req, res) => {
     try {
         const companyDomain = process.env.PIPEDRIVE_COMPANY_DOMAIN;
         const apiToken = process.env.PIPEDRIVE_API_TOKEN;
@@ -84,11 +97,28 @@ res.json({
     } catch (error) {
         res.status(500).json({
             error: "Erro ao buscar oportunidades no Pipedrive",
-            details: error.response?.data || error.message
+            details: "Falha na comunicação com o serviço externo."
         });
     }
 });
 app.get("/api/bling/auth", (req, res) => {
+
+const localAddresses = [
+    "127.0.0.1",
+    "::1",
+    "::ffff:127.0.0.1"
+];
+
+const isLocal = localAddresses.includes(
+    req.socket.remoteAddress
+);
+
+if (process.env.NODE_ENV === "production" || !isLocal) {
+    return res.status(403).json({
+        error: "Autorização do Bling restrita ao ambiente local."
+    });
+}
+
     const clientId = process.env.BLING_CLIENT_ID;
 
     if (!clientId) {
@@ -97,7 +127,16 @@ app.get("/api/bling/auth", (req, res) => {
         });
     }
 
-    const state = "pipedrive-bling-api";
+const state = crypto.randomBytes(32).toString("hex");
+
+res.cookie("bling_oauth_state", state, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 10 * 60 * 1000,
+    path: "/api/bling"
+});
+
     const authUrl = `https://www.bling.com.br/Api/v3/oauth/authorize?response_type=code&client_id=${clientId}&state=${state}`;
 
     res.redirect(authUrl);
@@ -105,7 +144,38 @@ app.get("/api/bling/auth", (req, res) => {
 
 app.get("/api/bling/callback", async (req, res) => {
     try {
-        const { code } = req.query;
+
+const { code, state } = req.query;
+
+const stateCookie = (req.headers.cookie || "")
+    .split(";")
+    .map(cookie => cookie.trim())
+    .find(cookie => cookie.startsWith("bling_oauth_state="));
+
+const savedState = stateCookie
+    ?.slice("bling_oauth_state=".length);
+
+const validState =
+    typeof state === "string" &&
+    typeof savedState === "string" &&
+    /^[a-f0-9]{64}$/.test(state) &&
+    /^[a-f0-9]{64}$/.test(savedState) &&
+    crypto.timingSafeEqual(
+        Buffer.from(state, "hex"),
+        Buffer.from(savedState, "hex")
+    );
+
+res.clearCookie("bling_oauth_state", {
+    path: "/api/bling",
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production"
+});
+
+if (!validState) {
+    return res.status(403).json({
+        error: "Autorização OAuth inválida ou expirada."
+    });
+}
 
         if (!code) {
             return res.status(400).json({
@@ -158,12 +228,12 @@ fs.writeFileSync(envPath, envFile, "utf8");
     } catch (error) {
         res.status(500).json({
             error: "Erro ao autorizar aplicativo no Bling",
-            details: error.response?.data || error.message
+            details: "Falha na comunicação com o serviço externo."
         });
     }
 });
 
-app.get("/api/bling/orders", async (req, res) => {
+app.get("/api/bling/orders", requireIntegrationApiKey, async (req, res) => {
     try {
         const accessToken = process.env.BLING_ACCESS_TOKEN;
 
@@ -190,111 +260,62 @@ app.get("/api/bling/orders", async (req, res) => {
     } catch (error) {
         res.status(500).json({
             error: "Erro ao buscar pedidos de venda no Bling",
-            details: error.response?.data || error.message
+            details: "Falha na comunicação com o serviço externo."
         });
     }
 });
 
-app.post("/api/integrations/pipedrive-to-bling", async (req, res) => {
-    try {
-        const companyDomain = process.env.PIPEDRIVE_COMPANY_DOMAIN;
-        const pipedriveToken = process.env.PIPEDRIVE_API_TOKEN;
-        const blingAccessToken = process.env.BLING_ACCESS_TOKEN;
+function requireIntegrationApiKey(req, res, next) {
+    const expectedKey = process.env.INTEGRATION_API_KEY;
+    const providedKey = req.get("x-api-key");
 
-        if (!companyDomain || !pipedriveToken || !blingAccessToken) {
-            return res.status(400).json({
-                error: "Configure PIPEDRIVE_COMPANY_DOMAIN, PIPEDRIVE_API_TOKEN e BLING_ACCESS_TOKEN no .env"
-            });
-        }
-
-        const pipedriveUrl = `https://${companyDomain}.pipedrive.com/api/v2/deals`;
-
-        const pipedriveResponse = await axios.get(pipedriveUrl, {
-            headers: {
-                "x-api-token": pipedriveToken
-            },
-            params: {
-                status: "won",
-                limit: 1
-            }
-        });
-
-        const deals = pipedriveResponse.data.data;
-
-        if (!deals || deals.length === 0) {
-            return res.status(404).json({
-                error: "Nenhuma oportunidade ganha encontrada no Pipedrive"
-            });
-        }
-
-        const deal = deals[0];
-
-        const today = new Date().toISOString().split("T")[0];
-
-        const orderPayload = {
-    numeroLoja: `PD-${deal.id}`,
-    data: today,
-    dataSaida: today,
-    dataPrevista: today,
-    contato: {
-        id: 18420326561
-    },
-    itens: [
-        {
-            id: 0,
-           codigo: `PD-${deal.id}-${Date.now()}`,
-                    unidade: "UN",
-                    quantidade: 1,
-                    valor: Number(deal.value) || 0,
-                    valorLista: Number(deal.value) || 0,
-                    descricao: deal.title || "Oportunidade Pipedrive"
-                }
-            ],
-            parcelas: [],
-observacoes: `Pedido criado automaticamente a partir da oportunidade ganha no Pipedrive. Deal ID: ${deal.id}. Criado em: ${new Date().toISOString()}`
-};
-const blingResponse = await axios.post(
-            "https://api.bling.com.br/Api/v3/pedidos/vendas",
-            orderPayload,
-            {
-                headers: {
-                    Authorization: `Bearer ${blingAccessToken}`,
-                    Accept: "application/json",
-                    "Content-Type": "application/json"
-                }
-            }
-        );
-
-const savedIntegration = await Integration.create({
-  pipedriveDealId: deal.id,
-  title: deal.title,
-  value: Number(deal.value) || 0,
-  status: deal.status,
-  blingOrderId: blingResponse.data?.data?.id || null,
-  blingResponse: blingResponse.data
-});
-
-        res.status(201).json({
-            message: "Oportunidade do Pipedrive enviada como pedido para o Bling",
-            pipedriveDeal: {
-                id: deal.id,
-                title: deal.title,
-                value: deal.value,
-                status: deal.status
-            },
-         blingOrder: blingResponse.data,
-savedIntegration
-        });
-    } catch (error) {
-        res.status(500).json({
-            error: "Erro ao integrar Pipedrive com Bling",
-            details: error.response?.data || error.message
+    if (!expectedKey) {
+        return res.status(503).json({
+            error: "Autenticação da integração não configurada."
         });
     }
-});
-app.get("/api/integrations/consolidated", async (req, res) => {
+
+    if (!providedKey) {
+        return res.status(401).json({
+            error: "Chave de acesso obrigatória."
+        });
+    }
+
+    const expected = Buffer.from(expectedKey);
+    const provided = Buffer.from(providedKey);
+
+    if (
+        expected.length !== provided.length ||
+        !crypto.timingSafeEqual(expected, provided)
+    ) {
+        return res.status(401).json({
+            error: "Chave de acesso inválida."
+        });
+    }
+
+    next();
+}
+
+// O processamento fica em um módulo separado para testes sem Bling/MongoDB reais.
+app.post("/api/integrations/pipedrive-to-bling", requireIntegrationApiKey, createIntegrationHandler({
+    Integration,
+    httpClient: axios,
+    env: process.env
+}));
+
+app.get("/api/integrations/consolidated", requireIntegrationApiKey, async (req, res) => {
   try {
     const consolidated = await Integration.aggregate([
+      // Não somar pedidos ainda em processamento ou aguardando revisão.
+      // Documentos antigos sem syncStatus são mantidos no consolidado.
+      {
+        $match: {
+          $or: [
+            { syncStatus: "completed" },
+            { syncStatus: { $exists: false } }
+          ]
+        }
+      },
       {
         $group: {
           _id: {
@@ -325,11 +346,11 @@ app.get("/api/integrations/consolidated", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       error: "Erro ao buscar dados consolidados",
-      details: error.message
+      details: "Falha ao consultar o banco de dados."
     });
   }
 });
-app.get("/api/bling/contacts", async (req, res) => {
+app.get("/api/bling/contacts", requireIntegrationApiKey, async (req, res) => {
     try {
         const accessToken = process.env.BLING_ACCESS_TOKEN;
 
@@ -365,7 +386,7 @@ app.get("/api/bling/contacts", async (req, res) => {
     } catch (error) {
         res.status(500).json({
             error: "Erro ao buscar contatos no Bling",
-            details: error.response?.data || error.message
+            details: "Falha na comunicação com o serviço externo."
         });
     }
 });
